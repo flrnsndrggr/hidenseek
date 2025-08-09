@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Matrix Hide and Seek</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <style>
+    :root { color-scheme: dark; }
+    html, body {
+      margin: 0; padding: 0; background: #000; color: #fff;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      height: 100%; width: 100%;
+      touch-action: none; overscroll-behavior: none;
+      -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent;
+    }
+    body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+    #hud { position: fixed; left: env(safe-area-inset-left); top: env(safe-area-inset-top); right: env(safe-area-inset-right);
+      display: flex; justify-content: space-between; padding: 8px 12px; font-size: clamp(12px, 1.8vw, 16px); pointer-events: none; opacity: .85; z-index: 10; }
+    canvas { display: block; width: 100vw; height: 100dvh; background: #000; }
+    #overlay { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,.6);
+      text-align: center; backdrop-filter: blur(1px); font-size: 18px; line-height: 1.6; color: #fff; z-index: 20; }
+    #overlay .panel { border: 1px solid #fff; padding: 20px 24px; background: rgba(0,0,0,.2); max-width: 640px; }
+  </style>
+</head>
+<body>
+  <div id="hud"><span id="level"></span><span id="status"></span><span id="fps"></span></div>
+  <div id="overlay"><div class="panel" id="overlayText"></div></div>
+  <canvas id="game"></canvas>
+<script>
+(function(){
+  const lerp=(a,b,t)=>a+(b-a)*t;
+  const clamp=(v,a,b)=>v<a?a:(v>b?b:v);
+  const dist2=(x1,y1,x2,y2)=>{const dx=x2-x1, dy=y2-y1; return dx*dx+dy*dy;};
+  function norm(vx,vy){const l=Math.hypot(vx,vy)||1; return [vx/l, vy/l];}
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  let DPR = Math.min(3, window.devicePixelRatio || 1), scale = DPR;
+  function fitCanvas(){
+    const vw = Math.max(1, window.innerWidth);
+    const vh = Math.max(1, window.innerHeight);
+    canvas.style.width = vw + 'px';
+    canvas.style.height = vh + 'px';
+    DPR = Math.min(3, window.devicePixelRatio || 1);
+    canvas.width  = Math.round(vw * DPR);
+    canvas.height = Math.round(vh * DPR);
+    scale = DPR;
+  }
+  window.addEventListener('resize', fitCanvas, { passive: true });
+  fitCanvas();
+  ['touchmove','gesturestart'].forEach(evt=>document.addEventListener(evt,e=>e.preventDefault(),{passive:false}));
+
+  const keys = new Set();
+  window.addEventListener('keydown', e=>{
+    const k = e.key.toLowerCase();
+    if(['arrowup','arrowdown','arrowleft','arrowright','w','a','s','d'].includes(k)) e.preventDefault();
+    keys.add(k);
+    if(k==='r') game.resetLevel();
+    if(k==='m') game.debug = !game.debug;
+  }, { passive: false });
+  window.addEventListener('keyup', e=> keys.delete(e.key.toLowerCase()), { passive: true });
+
+  const joystick = { active:false, cx:0, cy:0, x:0, y:0, radius:84, dead:10, max:72, vec:[0,0], mag:0 };
+  function pointerPos(e){ const t=e.touches?e.touches[0]:e; const r=canvas.getBoundingClientRect(); return {x:t.clientX-r.left, y:t.clientY-r.top}; }
+  function startJoy(e){ const p=pointerPos(e); if(p.x<=canvas.clientWidth*0.7){ joystick.active=true; joystick.cx=p.x; joystick.cy=p.y; joystick.x=p.x; joystick.y=p.y; joystick.vec=[0,0]; joystick.mag=0; } }
+  function moveJoy(e){
+    if(!joystick.active) return;
+    const p=pointerPos(e); const dx=p.x-joystick.cx, dy=p.y-joystick.cy; const d=Math.hypot(dx,dy); const ang=Math.atan2(dy,dx);
+    const clamped=Math.min(joystick.max,d); joystick.x=joystick.cx+Math.cos(ang)*clamped; joystick.y=joystick.cy+Math.sin(ang)*clamped;
+    if(d<joystick.dead){ joystick.vec=[0,0]; joystick.mag=0; } else { joystick.mag=Math.max(0,Math.min(1,(d-joystick.dead)/(joystick.max-joystick.dead))); joystick.vec=[Math.cos(ang),Math.sin(ang)]; }
+  }
+  function endJoy(){ joystick.active=false; joystick.vec=[0,0]; joystick.mag=0; }
+  canvas.addEventListener('pointerdown', startJoy, {passive:false});
+  canvas.addEventListener('pointermove', moveJoy,   {passive:false});
+  window.addEventListener('pointerup', endJoy, {passive:true});
+  window.addEventListener('pointercancel', endJoy, {passive:true});
+  canvas.addEventListener('touchstart', startJoy, {passive:false});
+  canvas.addEventListener('touchmove', moveJoy,   {passive:false});
+  window.addEventListener('touchend', endJoy, {passive:true});
+  window.addEventListener('touchcancel', endJoy, {passive:true});
+
+  function inputVector(){
+    let ax=0, ay=0;
+    if(keys.has('arrowleft')||keys.has('a')) ax -= 1;
+    if(keys.has('arrowright')||keys.has('d')) ax += 1;
+    if(keys.has('arrowup')||keys.has('w')) ay -= 1;
+    if(keys.has('arrowdown')||keys.has('s')) ay += 1;
+    if(joystick.active){ ax += joystick.vec[0]*joystick.mag; ay += joystick.vec[1]*joystick.mag; }
+    if(ax||ay){ const l=Math.hypot(ax,ay); const m=Math.min(1,l); const n=[ax/l, ay/l]; return [n[0]*m, n[1]*m]; }
+    return [0,0];
+  }
+
+  const W = ()=>canvas.width/scale, H = ()=>canvas.height/scale;
+  const BOT_RADIUS=14, PLAYER_RADIUS=12, PARTICLE_COUNT=3800, GRID_SIZE=16;
+
+  function rectsIntersect(a,b){return !(a.x+a.w<b.x||b.x+b.w<a.x||a.y+a.h<b.y||b.y+b.h<a.y);}
+  function circleRectCollide(cx,cy,cr,r){ const x=clamp(cx,r.x,r.x+r.w), y=clamp(cy,r.y,r.y+r.h); const dx=cx-x, dy=cy-y; return dx*dx+dy*dy<=cr*cr; }
+  function segIntersect(ax,ay,bx,by,cx,cy,dx,dy){ const rpx=bx-ax,rpy=by-ay,spx=dx-cx,spy=dy-cy,den=(-spx*rpy+rpx*spy); if(den===0)return false; const s=(-rpy*(ax-cx)+rpx*(ay-cy))/den; const t=(spx*(ay-cy)-spy*(ax-cx))/den; return s>=0&&s<=1&&t>=0&&t<=1; }
+  function lineRectIntersect(x1,y1,x2,y2,r){ const x3=r.x,y3=r.y,x4=r.x+r.w,y4=r.y+r.h; return segIntersect(x1,y1,x2,y2,x3,y3,x4,y3)||segIntersect(x1,y1,x2,y2,x4,y3,x4,y4)||segIntersect(x1,y1,x2,y2,x4,y4,x3,y4)||segIntersect(x1,y1,x2,y2,x3,y4,x3,y3); }
+
+  function isCoarsePointer(){ return window.matchMedia && window.matchMedia('(pointer:coarse)').matches; }
+  function genLevelConfig(level){
+    const mobile = isCoarsePointer() || (Math.min(window.innerWidth, window.innerHeight) < 820);
+    return {
+      playerSpeed:   mobile ? 3200 : (1800 + Math.min(600, level*120)),
+      playerFriction:mobile ? 0.90 : 0.93,
+      playerMaxSpeed:mobile ? 820  : (420 + Math.min(180, level*20)),
+      botSpeed:130 + Math.min(100, level*8),
+      botPathRecalc:Math.max(0.08, 0.32 - level*0.02),
+      botSightRange:240 + level*12,
+      botFOV:Math.PI*0.75,
+      botHearing:110 + level*8,
+      obstacleCount:8 + Math.min(22, Math.floor(level*1.6)),
+      obstacleMaxSize:160,
+      searchSpots:6 + Math.min(8, Math.floor(level/2)),
+    };
+  }
+
+  function makeObstacles(count){
+    const obs=[]; const minW=60,minH=40,maxW=180,maxH=160; let tries=0;
+    while(obs.length<count && tries<count*20){
+      tries++; const w=minW+Math.random()*(maxW-minW), h=minH+Math.random()*(maxH-minH);
+      const x=20+Math.random()*(W()-w-40), y=20+Math.random()*(H()-h-40); const r={x,y,w,h}; let ok=true;
+      for(const o of obs){ if(!(r.x-8+r.w+16<o.x||o.x+o.w<r.x-8||r.y-8+r.h+16<o.y||o.y+o.h<r.y-8)){ ok=false; break; } }
+      if(ok) obs.push(r);
+    }
+    return obs;
+  }
+  function randomFreePoint(obstacles,radius){
+    for(let i=0;i<2000;i++){ const x=radius+8+Math.random()*(W()-2*radius-16), y=radius+8+Math.random()*(H()-2*radius-16);
+      let coll=false; for(const o of obstacles){ if(circleRectCollide(x,y,radius+3,o)){ coll=true; break; } } if(!coll) return {x,y}; }
+    return {x:radius+16,y:radius+16};
+  }
+
+  class MinHeap{ constructor(c){this.c=c;this.a=[];} push(v){const a=this.a; a.push(v); let i=a.length-1; while(i>0){const p=(i-1)>>1; if(this.c(a[i],a[p])<0){[a[i],a[p]]=[a[p],a[i]]; i=p;} else break;}} pop(){const a=this.a; if(a.length===0)return null; const t=a[0]; const v=a.pop(); if(a.length>0){a[0]=v; this.down(0);} return t;} down(i){const a=this.a,n=a.length,c=this.c; while(true){let l=i*2+1,r=l+1,s=i; if(l<n&&c(a[l],a[s])<0)s=l; if(r<n&&c(a[r],a[s])<0)s=r; if(s===i)break; [a[i],a[s]]=[a[s],a[i]]; i=s;}} empty(){return this.a.length===0;} }
+  class Grid{
+    constructor(obstacles,agentRadius){
+      this.cs=GRID_SIZE; this.cols=Math.floor(W()/this.cs); this.rows=Math.floor(H()/this.cs);
+      this.blocked=new Uint8Array(this.cols*this.rows);
+      for(let gy=0;gy<this.rows;gy++) for(let gx=0;gx<this.cols;gx++){
+        const cx=gx*this.cs+this.cs*0.5, cy=gy*this.cs+this.cs*0.5, idx=gy*this.cols+gx;
+        if(gx<=0||gy<=0||gx>=this.cols-1||gy>=this.rows-1){ this.blocked[idx]=1; continue; }
+        let blocked=false; for(const o of obstacles){ if(circleRectCollide(cx,cy,agentRadius+2,o)){blocked=true;break;} } this.blocked[idx]=blocked?1:0;
+      }
+    }
+    inBounds(gx,gy){return gx>=0&&gy>=0&&gx<this.cols&&gy<this.rows;} isBlocked(gx,gy){return this.blocked[gy*this.cols+gx]===1;}
+    cellOf(x,y){return {gx:Math.floor(x/this.cs), gy:Math.floor(y/this.cs)};} toWorld(gx,gy){return {x:gx*this.cs+this.cs*0.5, y:gy*this.cs+this.cs*0.5};}
+    neighbors(gx,gy){ const out=[]; for(let oy=-1;oy<=1;oy++) for(let ox=-1;ox<=1;ox++){ if(!ox&&!oy)continue; const nx=gx+ox, ny=gy+oy; if(!this.inBounds(nx,ny))continue; if(this.isBlocked(nx,ny))continue; if(ox&&oy &&(this.isBlocked(gx+ox,gy)||this.isBlocked(gx,gy+oy))) continue; out.push({gx:nx,gy:ny,w:(ox===0||oy===0)?1:1.41421356}); } return out; }
+    losClear(x1,y1,x2,y2,obstacles){ for(const o of obstacles){ if(lineRectIntersect(x1,y1,x2,y2,o)) return false; } return true; }
+    findPath(x1,y1,x2,y2){
+      const s=this.cellOf(x1,y1), g=this.cellOf(x2,y2); if(!this.inBounds(s.gx,s.gy)||!this.inBounds(g.gx,g.gy))return null; if(this.isBlocked(g.gx,g.gy))return null;
+      const idx=(gx,gy)=>gy*this.cols+gx; const open=new MinHeap((a,b)=>a.f-b.f);
+      const cameX=new Int16Array(this.cols*this.rows).fill(-1), cameY=new Int16Array(this.cols*this.rows).fill(-1);
+      const gScore=new Float32Array(this.cols*this.rows).fill(Infinity), fScore=new Float32Array(this.cols*this.rows).fill(Infinity);
+      const startI=idx(s.gx,s.gy), goalI=idx(g.gx,g.gy); gScore[startI]=0; fScore[startI]=heur(s.gx,s.gy,g.gx,g.gy); open.push({gx:s.gx,gy:s.gy,f:fScore[startI]});
+      const closed=new Uint8Array(this.cols*this.rows); let safety=0, maxNodes=this.cols*this.rows;
+      while(!open.empty()&&safety++<maxNodes){
+        const cur=open.pop(); const ci=idx(cur.gx,cur.gy); if(closed[ci])continue; if(ci===goalI){ const path=[]; let cx=cur.gx, cy=cur.gy; while(!(cx===s.gx&&cy===s.gy)){ path.push(this.toWorld(cx,cy)); const pi=idx(cx,cy); const px=cameX[pi], py=cameY[pi]; if(px<0)break; cx=px; cy=py; } path.push(this.toWorld(s.gx,s.gy)); path.reverse(); return path; }
+        closed[ci]=1;
+        for(const n of this.neighbors(cur.gx,cur.gy)){ const ni=idx(n.gx,n.gy); if(closed[ni])continue; const t=gScore[ci]+n.w; if(t<gScore[ni]){ cameX[ni]=cur.gx; cameY[ni]=cur.gy; gScore[ni]=t; fScore[ni]=t+heur(n.gx,n.gy,g.gx,g.gy); open.push({gx:n.gx,gy:n.gy,f:fScore[ni]}); } }
+      }
+      return null;
+      function heur(ax,ay,bx,by){ const dx=Math.abs(ax-bx), dy=Math.abs(ay-by); const dmin=Math.min(dx,dy), dmax=Math.max(dx,dy); return (dmax-dmin)+1.41421356*dmin; }
+    }
+  }
+
+  class ParticleMist{
+    constructor(count, obstacles){
+      this.n=count; this.active=count;
+      this.px=new Float32Array(count); this.py=new Float32Array(count);
+      this.vx=new Float32Array(count); this.vy=new Float32Array(count);
+      for(let i=0;i<count;i++){ this.px[i]=Math.random()*W(); this.py[i]=Math.random()*H(); this.vx[i]=Math.random()*20-10; this.vy[i]=Math.random()*20-10; }
+      this.t=0; this.obstacles = obstacles;
+    }
+    setActive(n){ this.active=Math.max(800, Math.min(this.n, n|0)); }
+    flow(x,y,t){ const s1=0.0025,s2=0.0018; const a=Math.sin(x*s1+t*0.6)+Math.cos(y*s1-t*0.7); const b=Math.sin(y*s2+t*0.5)-Math.cos(x*s2-t*0.4); const ang=Math.atan2(b,a); return [Math.cos(ang),Math.sin(ang)]; }
+    step(dt, player, bot){
+      this.t+=dt; const base=32, n=this.active;
+      for(let i=0;i<n;i++){
+        const x=this.px[i], y=this.py[i]; const f=this.flow(x,y,this.t); let ax=f[0]*base, ay=f[1]*base;
+        const repel=(cx,cy,r,str)=>{ const dx=x-cx, dy=y-cy, d2=dx*dx+dy*dy; if(d2<r*r){ const d=Math.sqrt(d2)||0.0001, inv=1-d/r; ax+=(dx/d)*str*inv; ay+=(dy/d)*str*inv; } };
+        repel(player.x,player.y,70,120); repel(bot.x,bot.y,90,180);
+        this.vx[i] = this.vx[i] + (ax - this.vx[i])*0.12;
+        this.vy[i] = this.vy[i] + (ay - this.vy[i])*0.12;
+        let nx=x+this.vx[i]*dt, ny=y+this.vy[i]*dt;
+        if(nx<0){nx=0; this.vx[i]*=-0.4;} if(ny<0){ny=0; this.vy[i]*=-0.4;}
+        if(nx>W()){nx=W(); this.vx[i]*=-0.4;} if(ny>H()){ny=H(); this.vy[i]*=-0.4;}
+        this.px[i]=nx; this.py[i]=ny;
+      }
+    }
+    draw(ctx){
+      ctx.save(); ctx.globalAlpha=0.08; ctx.fillStyle='#d0d0d0';
+      const n=this.active; for(let i=0;i<n;i++){ ctx.fillRect(this.px[i]*scale, this.py[i]*scale, 1.1*scale, 1.1*scale); }
+      ctx.restore();
+    }
+  }
+
+  class Player{
+    constructor(pos){ this.x=pos.x; this.y=pos.y; this.r=PLAYER_RADIUS; this.vx=0; this.vy=0; }
+    update(dt, cfg, obstacles){
+      const iv=inputVector(); const mag=joystick.active?joystick.mag:((iv[0]||iv[1])?1:0);
+      this.vx += iv[0]*cfg.playerSpeed*dt*(0.7+0.3*mag);
+      this.vy += iv[1]*cfg.playerSpeed*dt*(0.7+0.3*mag);
+      this.vx *= cfg.playerFriction; this.vy *= cfg.playerFriction;
+      const sp=Math.hypot(this.vx,this.vy), max=cfg.playerMaxSpeed; if(sp>max){ const f=max/sp; this.vx*=f; this.vy*=f; }
+      let nx=this.x+this.vx*dt, ny=this.y+this.vy*dt;
+      if(nx<this.r){nx=this.r; this.vx=0;} if(ny<this.r){ny=this.r; this.vy=0;}
+      if(nx>W()-this.r){nx=W()-this.r; this.vx=0;} if(ny>H()-this.r){ny=H()-this.r; this.vy=0;}
+      for(const o of game.obstacles){
+        if(circleRectCollide(nx,ny,this.r,o)){
+          const tryX=this.x+this.vx*dt; if(!circleRectCollide(tryX,this.y,this.r,o)){ nx=tryX; ny=this.y; this.vy=0; }
+          else{ const tryY=this.y+this.vy*dt; if(!circleRectCollide(this.x,tryY,this.r,o)){ ny=tryY; nx=this.x; this.vx=0; }
+          else{ const dx=this.x-(o.x+o.w*0.5), dy=this.y-(o.y+o.h*0.5); const l=Math.hypot(dx,dy)||1; nx=this.x+dx/l*2; ny=this.y+dy/l*2; this.vx*=0.5; this.vy*=0.5; } }
+        }
+      }
+      this.x=nx; this.y=ny;
+    }
+    draw(ctx){
+      ctx.save(); ctx.shadowColor='#ffffff'; ctx.shadowBlur=12*scale; ctx.fillStyle='#ffffff';
+      ctx.beginPath(); ctx.arc(this.x*scale,this.y*scale,this.r*scale,0,Math.PI*2); ctx.fill(); ctx.restore();
+    }
+  }
+  class Bot{
+    constructor(pos){ this.x=pos.x; this.y=pos.y; this.r=BOT_RADIUS; this.vx=0; this.vy=0; this.speed=120;
+      this.state='patrol'; this.lastSeen=null; this.path=[]; this.pathIndex=0; this.pathTimer=0; this.patrolPoints=[]; this.currentPatrol=0; this.searchPoints=[]; this.currentSearch=0; }
+    canSee(player, obstacles, cfg){
+      const dx=player.x-this.x, dy=player.y-this.y; if(dx*dx+dy*dy>cfg.botSightRange*cfg.botSightRange) return false;
+      const heading=Math.atan2(this.vy||0.0001,this.vx||0.0001), dir=Math.atan2(dy,dx);
+      let ang=Math.abs(((dir-heading+Math.PI*3)%(Math.PI*2))-Math.PI); if(ang>cfg.botFOV*0.5) return false;
+      for(const o of obstacles){ if(lineRectIntersect(this.x,this.y,player.x,player.y,o)) return false; } return true;
+    }
+    canHear(player,cfg){ const moving=Math.hypot(player.vx,player.vy); if(moving<10)return false; return dist2(this.x,this.y,player.x,player.y)<=cfg.botHearing*cfg.botHearing; }
+    setPatrol(grid){
+      const pts=[]; for(let i=0;i<4;i++){ const gx=Math.floor(Math.random()*(grid.cols-4))+2, gy=Math.floor(Math.random()*(grid.rows-4))+2; if(!grid.isBlocked(gx,gy)) pts.push(grid.toWorld(gx,gy)); }
+      if(!pts.length) pts.push({x:this.x,y:this.y}); this.patrolPoints=pts; this.currentPatrol=0;
+    }
+    planSearchAround(p,cfg,grid){
+      const pts=[], rad=80, n=cfg.searchSpots; for(let i=0;i<n;i++){
+        const t=i/n*Math.PI*2; const px=clamp(p.x+Math.cos(t)*rad,BOT_RADIUS+8,W()-BOT_RADIUS-8); const py=clamp(p.y+Math.sin(t)*rad,BOT_RADIUS+8,H()-BOT_RADIUS-8);
+        const c=grid.cellOf(px,py); if(!grid.isBlocked(c.gx,c.gy)) pts.push(grid.toWorld(c.gx,c.gy));
+      }
+      this.searchPoints=pts; this.currentSearch=0;
+    }
+    update(dt, player, obstacles, cfg, grid){
+      this.speed=cfg.botSpeed; const see=this.canSee(player,obstacles,cfg), hear=this.canHear(player,cfg);
+      if(see){ this.state='chase'; this.lastSeen={x:player.x,y:player.y}; } else if(this.state!=='chase'&&hear){ this.state='search'; this.lastSeen={x:player.x,y:player.y}; }
+      this.pathTimer-=dt;
+      if(this.state==='chase'){
+        if(grid.losClear(this.x,this.y,player.x,player.y,obstacles)){ this.seek(player.x,player.y,dt); }
+        else{
+          if(this.pathTimer<=0){ const path=grid.findPath(this.x,this.y,player.x,player.y); if(path&&path.length>1){ this.path=path; this.pathIndex=1; } this.pathTimer=cfg.botPathRecalc; }
+          this.followPath(dt);
+        }
+        if(!see && this.lastSeen){ this.state='search'; this.planSearchAround(this.lastSeen,cfg,grid); }
+      } else if(this.state==='search'){
+        if(this.lastSeen){
+          if(this.pathTimer<=0){ const path=grid.findPath(this.x,this.y,this.lastSeen.x,this.lastSeen.y); if(path&&path.length>1){ this.path=path; this.pathIndex=1; } this.pathTimer=cfg.botPathRecalc*1.1; }
+          if(Math.hypot(this.x-this.lastSeen.x,this.y-this.lastSeen.y)<18){
+            if(!this.searchPoints.length) this.planSearchAround(this.lastSeen,cfg,grid);
+            const target=this.searchPoints[this.currentSearch%Math.max(1,this.searchPoints.length)];
+            if(this.pathTimer<=0){ const p2=grid.findPath(this.x,this.y,target.x,target.y); if(p2&&p2.length>1){ this.path=p2; this.pathIndex=1; } this.pathTimer=cfg.botPathRecalc*1.2; this.currentSearch++; if(this.currentSearch>this.searchPoints.length*2){ this.state='patrol'; } }
+          }
+          this.followPath(dt);
+        } else this.state='patrol';
+      } else {
+        if(!this.patrolPoints.length) this.setPatrol(grid);
+        const t=this.patrolPoints[this.currentPatrol%this.patrolPoints.length];
+        if(this.pathTimer<=0){ const p=grid.findPath(this.x,this.y,t.x,t.y); if(p&&p.length>1){ this.path=p; this.pathIndex=1; } this.pathTimer=cfg.botPathRecalc*1.3; }
+        this.followPath(dt); if(Math.hypot(this.x-t.x,this.y-t.y)<18) this.currentPatrol++;
+      }
+    }
+    followPath(dt){
+      if(!this.path||this.pathIndex>=this.path.length){ this.vx*=0.9; this.vy*=0.9; this.x+=this.vx*dt; this.y+=this.vy*dt; return; }
+      const target=this.path[this.pathIndex]; const dx=target.x-this.x, dy=target.y-this.y; const d=Math.hypot(dx,dy); if(d<6){ this.pathIndex++; return; }
+      const n=[dx/d, dy/d]; this.vx=n[0]*this.speed; this.vy=n[1]*this.speed;
+      let nx=this.x+this.vx*dt, ny=this.y+this.vy*dt;
+      if(nx<this.r)nx=this.r; if(ny<this.r)ny=this.r; if(nx>W()-this.r)nx=W()-this.r; if(ny>H()-this.r)ny=H()-this.r;
+      for(const o of game.obstacles){ if(circleRectCollide(nx,ny,this.r,o)){ const tryX=this.x+this.vx*dt; if(!circleRectCollide(tryX,this.y,this.r,o)){ nx=tryX; ny=this.y; this.vy=0; } else { const tryY=this.y+this.vy*dt; if(!circleRectCollide(this.x,tryY,this.r,o)){ ny=tryY; nx=this.x; this.vx=0; } else { nx=this.x; ny=this.y; this.vx=0; this.vy=0; } } } }
+      this.x=nx; this.y=ny;
+    }
+    seek(tx,ty,dt){ const dx=tx-this.x, dy=ty-this.y, d=Math.hypot(dx,dy)||1, n=[dx/d,dy/d]; this.vx=n[0]*this.speed; this.vy=n[1]*this.speed; this.x+=this.vx*dt; this.y+=this.vy*dt; }
+    draw(ctx){
+      ctx.save(); ctx.shadowColor='#ff2a2a'; ctx.shadowBlur=14*scale; ctx.fillStyle='#ff2a2a';
+      const x=this.x*scale, y=this.y*scale, r=this.r*scale; ctx.beginPath();
+      for(let i=0;i<6;i++){ const a=(Math.PI/3)*i+Math.PI/6; const px=x+Math.cos(a)*r, py=y+Math.sin(a)*r; if(i===0)ctx.moveTo(px,py); else ctx.lineTo(px,py); }
+      ctx.closePath(); ctx.fill(); ctx.restore();
+    }
+  }
+
+  const hudLevel=document.getElementById('level'), hudFps=document.getElementById('fps'), overlay=document.getElementById('overlay'), overlayText=document.getElementById('overlayText');
+  const game={
+    level:1, player:null, bot:null, obstacles:[], exitRect:{x:0,y:0,w:26,h:26}, grid:null, mist:null, running:true, debug:false, bg:{x:0,y:0}, time:0,
+    init(){ this.buildLevel(this.level); loop(performance.now()); this.showMessage("Find the exit. Avoid the red hexagon. Arrow keys or left thumb. R restart. M debug."); if('serviceWorker' in navigator){ navigator.serviceWorker.register('sw.js').catch(()=>{}); } },
+    buildLevel(level){
+      const cfg=genLevelConfig(level); this.obstacles=makeObstacles(cfg.obstacleCount); this.grid=new Grid(this.obstacles, BOT_RADIUS);
+      const ppos=randomFreePoint(this.obstacles, PLAYER_RADIUS); this.player=new Player(ppos);
+      const bpos=randomFreePoint(this.obstacles, BOT_RADIUS); this.bot=new Bot(bpos);
+      let attempt=0; do{
+        const r={x:20+Math.random()*(W()-40), y:20+Math.random()*(H()-40), w:26, h:26}; let coll=false;
+        for(const o of this.obstacles){ if(rectsIntersect({x:r.x-6,y:r.y-6,w:r.w+12,h:r.h+12},o)){ coll=true; break; } }
+        if(!coll) this.exitRect=r; attempt++;
+      } while(attempt<200 && dist2(this.player.x,this.player.y,this.exitRect.x+this.exitRect.w/2,this.exitRect.y+this.exitRect.h/2) < (W()*0.25)*(H()*0.25));
+      const pathToExit=this.grid.findPath(this.player.x,this.player.y,this.exitRect.x+this.exitRect.w/2,this.exitRect.y+this.exitRect.h/2); if(!pathToExit){ this.buildLevel(level); return; }
+      this.mist=new ParticleMist(PARTICLE_COUNT, this.obstacles); this.cfg=cfg; this.bot.setPatrol(this.grid); this.bg.x=this.player.x; this.bg.y=this.player.y; this.running=true;
+    },
+    resetLevel(){ this.buildLevel(this.level); },
+    nextLevel(){ this.level++; this.buildLevel(this.level); this.showMessage("Matrix "+this.level+" loaded."); },
+    showMessage(text){
+      overlay.style.display='flex'; overlayText.innerHTML=text+'<div style="margin-top:8px; opacity:.75">Tap or key to continue</div>';
+      const hide=()=>{ overlay.style.display='none'; window.removeEventListener('keydown', hideOnce, true); window.removeEventListener('pointerdown', hideOnce, true); };
+      const hideOnce=()=>{ hide(); }; window.addEventListener('keydown', hideOnce, true); window.addEventListener('pointerdown', hideOnce, true); setTimeout(hide, 2200);
+    },
+    onFps(fps){ if(fps<48) this.mist.setActive(2200); else if(fps<54) this.mist.setActive(3000); else this.mist.setActive(PARTICLE_COUNT); },
+    update(dt){
+      this.time+=dt; hudLevel.textContent='Matrix '+this.level; const cfg=this.cfg;
+      this.player.update(dt,cfg,this.obstacles); this.bot.update(dt,this.player,this.obstacles,cfg,this.grid); this.mist.step(dt,this.player,this.bot);
+      this.bg.x=lerp(this.bg.x,this.player.x,0.05); this.bg.y=lerp(this.bg.y,this.player.y,0.05);
+      if(circleRectCollide(this.player.x,this.player.y,this.player.r,this.exitRect)) this.nextLevel();
+      if(Math.hypot(this.player.x-this.bot.x,this.player.y-this.bot.y) < this.player.r+this.bot.r-2){ this.running=false; this.showMessage("Caught. Press R or tap overlay to restart."); }
+    },
+    drawBackground(){
+      const cx=this.bg.x*scale, cy=this.bg.y*scale, r=Math.hypot(canvas.width,canvas.height)*0.6;
+      const g=ctx.createRadialGradient(cx,cy,0,cx,cy,r); g.addColorStop(0,'#101010'); g.addColorStop(1,'#000000');
+      ctx.fillStyle=g; ctx.fillRect(0,0,canvas.width,canvas.height);
+      ctx.save(); ctx.globalAlpha=0.035; ctx.strokeStyle='#ffffff';
+      const s=Math.max(36*scale, Math.min(canvas.width,canvas.height)/18), off=(this.time*15)%s;
+      ctx.beginPath(); for(let x=off;x<canvas.width;x+=s){ ctx.moveTo(x,0); ctx.lineTo(x,canvas.height); } for(let y=off;y<canvas.height;y+=s){ ctx.moveTo(0,y); ctx.lineTo(canvas.width,y); } ctx.stroke(); ctx.restore();
+    },
+    draw(){
+      ctx.clearRect(0,0,canvas.width,canvas.height); this.drawBackground(); this.mist.draw(ctx);
+      ctx.save(); ctx.fillStyle='#ffffff'; for(const o of this.obstacles){ ctx.fillRect(o.x*scale,o.y*scale,o.w*scale,o.h*scale); } ctx.restore();
+      ctx.save(); const pulse=1+0.06*Math.sin(this.time*4); ctx.lineWidth=2*scale*pulse; ctx.strokeStyle='#ffffff'; ctx.setLineDash([6*scale,10*scale]); ctx.lineDashOffset=-this.time*60*scale;
+      ctx.strokeRect(this.exitRect.x*scale,this.exitRect.y*scale,this.exitRect.w*scale,this.exitRect.h*scale); ctx.setLineDash([]); ctx.restore();
+      this.player.draw(ctx); this.bot.draw(ctx);
+      if(joystick.active){ const baseA=0.2, knobA=0.35; ctx.save(); ctx.fillStyle='rgba(255,255,255,'+baseA+')'; ctx.beginPath(); ctx.arc(joystick.cx*scale,joystick.cy*scale,joystick.radius*scale,0,Math.PI*2); ctx.fill();
+        ctx.fillStyle='rgba(255,255,255,'+knobA+')'; ctx.beginPath(); ctx.arc(joystick.x*scale,joystick.y*scale,(joystick.radius*0.45)*scale,0,Math.PI*2); ctx.fill(); ctx.restore(); }
+    }
+  };
+
+  let last=performance.now(), acc=0; const DT=1/60; let frames=0, fps=0, fpsTimer=0;
+  function loop(t){
+    requestAnimationFrame(loop);
+    const elapsed=Math.min(0.25,(t-last)/1000); last=t; acc+=elapsed;
+    while(acc>=DT){ if(game.running) game.update(DT); acc-=DT; }
+    game.draw();
+    frames++; fpsTimer+=elapsed; if(fpsTimer>=0.5){ fps=Math.round(frames/fpsTimer); frames=0; fpsTimer=0; document.getElementById('fps').textContent=fps+' fps'; game.onFps(fps); }
+  }
+
+  function circleRectCollide(cx,cy,cr,r){ const x=clamp(cx,r.x,r.x+r.w), y=clamp(cy,r.y,r.y+r.h); const dx=cx-x, dy=cy-y; return dx*dx+dy*dy<=cr*cr; }
+
+  game.init(); window.game=game;
+})();
+</script>
+</body>
+</html>

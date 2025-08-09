@@ -1,0 +1,12 @@
+{
+  "name": "Matrix Hide and Seek",
+  "short_name": "Matrix HnS",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "description": "Stealth chase through synthetic matrices. Mobile-friendly.",
+  "orientation": "any",
+  "icons": []
+}
