@@ -193,6 +193,18 @@
   // Safe localStorage helpers
   function safeGet(k){ try{ return localStorage.getItem(k); }catch{ return null; } }
   function safeSet(k,v){ try{ localStorage.setItem(k,v); }catch{} }
+  // Bot kind -> color helper (single source of truth)
+  function botColor(kind){
+    return kind==='tele'?'#bb66ff'
+      : kind==='eater'?'#ffaa44'
+      : kind==='cloner'?'#66ffee'
+      : kind==='grower'?'#ff66aa'
+      : kind==='phase'?'#99ff99'
+      : kind==='mimic'?'#ffffff'
+      : kind==='turret'?'#ffbbcc'
+      : kind==='stalker'?'#66aaff'
+      : '#ff2a2a';
+  }
 
   function rectsIntersect(a,b){return !(a.x+a.w<b.x||b.x+b.w<a.x||a.y+a.h<b.y||b.y+b.h<a.y);}
   function circleRectCollide(cx,cy,cr,r){ const x=clamp(cx,r.x,r.x+r.w), y=clamp(cy,r.y,r.y+r.h); const dx=cx-x, dy=cy-y; return dx*dx+dy*dy<=cr*cr; }
@@ -349,23 +361,26 @@
       this.ctx=null; this.muted=false;
       this.master=null; this.bgGain=null; this.fxGain=null;
       this.buffers={ background:null, movement:null, timer:null };
-      this.bgNode=null; this.timerNode=null; this.movementNode=null;
+      this.bgNode=null; this.bgEl=null; this.timerNode=null; this.movementNode=null;
       this.loaded=false; this.loading=false;
+      this.bgRetry=null;
     }
     init(){
-      if(this.ctx) return;
-      try{ this.ctx=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){ this.ctx=null; }
+      if(!this.ctx){ try{ this.ctx=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){ this.ctx=null; } }
       if(!this.ctx) return;
-      // Gains
-      this.master=this.ctx.createGain(); this.master.gain.value=this.muted?0:1; this.master.connect(this.ctx.destination);
-      this.bgGain=this.ctx.createGain(); this.bgGain.gain.value=0.35; this.bgGain.connect(this.master);
-      this.fxGain=this.ctx.createGain(); this.fxGain.gain.value=1.0; this.fxGain.connect(this.master);
+      if(!this.master){
+        // Gains
+        this.master=this.ctx.createGain(); this.master.gain.value=this.muted?0:1; this.master.connect(this.ctx.destination);
+        this.bgGain=this.ctx.createGain(); this.bgGain.gain.value=0.35; this.bgGain.connect(this.master);
+        this.fxGain=this.ctx.createGain(); this.fxGain.gain.value=1.0; this.fxGain.connect(this.master);
+      }
       // Lazy-load audio files
       this.load();
-      // Resume context (autoplay policies)
-      try{ this.ctx.resume().catch(()=>{}); }catch{}
-      // If already loaded (unlikely), ensure background starts
-      this.startBackground();
+      const tryStart = async()=>{ try{ await this.ctx.resume(); }catch{} this.startBackground(); };
+      tryStart();
+      // Keep retrying until bg is playing (handles autoplay restrictions)
+      if(!this.bgRetry){ this.bgRetry = setInterval(()=>{ if(!this.isBgPlaying()){ tryStart(); } else { clearInterval(this.bgRetry); this.bgRetry=null; } }, 1200); }
+      document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible' && !this.isBgPlaying()) tryStart(); }, { passive:true });
     }
     canPlay(){ return !!this.ctx; }
     toggleMute(){ this.muted=!this.muted; if(this.master) this.master.gain.value=this.muted?0:1; }
@@ -385,12 +400,20 @@
         this.startBackground();
       }catch(e){ this.loading=false; }
     }
+    isBgPlaying(){ return !!(this.bgNode || (this.bgEl && !this.bgEl.paused)); }
     startBackground(){
-      if(!this.ctx||!this.buffers.background) return;
-      // If already playing, keep it running across level changes
-      if(this.bgNode) return;
-      const src=this.ctx.createBufferSource(); src.buffer=this.buffers.background; src.loop=true; src.connect(this.bgGain); src.start();
-      this.bgNode=src;
+      if(!this.ctx) return;
+      if(this.isBgPlaying()) return;
+      // Prefer decoded buffer
+      if(this.buffers.background){
+        try{ const src=this.ctx.createBufferSource(); src.buffer=this.buffers.background; src.loop=true; src.connect(this.bgGain); src.start(); this.bgNode=src; return; }catch{}
+      }
+      // Fallback: HTMLAudio element routed into WebAudio
+      try{
+        if(!this.bgEl){ this.bgEl=new Audio('background.mp3'); this.bgEl.loop=true; this.bgEl.preload='auto'; this.bgEl.crossOrigin='anonymous'; }
+        const ensureNode=()=>{ try{ if(!this.bgEl._node){ const ms=this.ctx.createMediaElementSource(this.bgEl); ms.connect(this.bgGain); this.bgEl._node=ms; } }catch{} };
+        ensureNode(); const p=this.bgEl.play(); if(p&&p.catch){ p.catch(()=>{}); }
+      }catch{}
     }
     stopBackground(){ if(this.bgNode){ try{ this.bgNode.stop(); }catch{} this.bgNode.disconnect(); this.bgNode=null; } }
     playMovement(){
@@ -636,6 +659,8 @@
       const initAudioOnce=()=>{ this.audio.init(); };
       window.addEventListener('pointerdown', initAudioOnce, { once:true, capture:true });
       window.addEventListener('keydown', initAudioOnce, { once:true, capture:true });
+      // Try start audio immediately as well (will retry until allowed)
+      this.audio.init();
       this.showMessage("Find the exit. Avoid the red hexagon. Arrow keys or left thumb. R restart. M debug.");
       if('serviceWorker' in navigator){ navigator.serviceWorker.register('sw.js').catch(()=>{}); }
     },
@@ -956,6 +981,8 @@
           this.effects.push(new Burst(this.player.x, this.player.y, '#ffffff', 200));
           if(hitBot){ const cx=(this.player.x+hitBot.x)*0.5, cy=(this.player.y+hitBot.y)*0.5; this.effects.push(new Burst(cx, cy, '#ff2a2a', 220)); }
           this.audio.caught();
+          // Immediately stop movement/timer loops on caught
+          this.audio.stopMovement(); this.audio.stopTimerLoop?.();
         }
         this.running=false; this.showMessage("Caught. Tap to start a new run or press R.", ()=>{ if(!this.running) this.startNewRun(); });
         }
@@ -1001,6 +1028,16 @@
       // Trails behind entities
       this.trails.player?.draw(ctx); for(const tr of this.trails.bots){ tr.draw(ctx); }
       this.player.draw(ctx); for(const b of this.bots){ b.draw(ctx); }
+      // In-world power-up duration rings around player
+      if(this.slowTimer>0||this.freezeTimer>0||this.dashTimer>0||this.predatorTimer>0){
+        const px=this.player.x*scale, py=this.player.y*scale, rr=this.player.r*scale+8*scale; ctx.save(); ctx.lineWidth=3*scale; ctx.globalAlpha=0.95; ctx.lineCap='round';
+        const ring=(timer,total,col,ofs)=>{ if(!(timer>0&&total)) return; const frac=Math.max(0,Math.min(1,timer/total)); ctx.strokeStyle=col; const a0=ofs+this.time*1.6, a1=a0+frac*Math.PI*2; ctx.beginPath(); ctx.arc(px,py,rr, a0, a1); ctx.stroke(); };
+        ring(this.slowTimer,this.slowTotal,'#bbbbbb',0);
+        ring(this.freezeTimer,this.freezeTotal,'#bbddff',Math.PI*0.33);
+        ring(this.dashTimer,this.dashTotal,'#ffffff',Math.PI*0.66);
+        ring(this.predatorTimer,this.predatorTotal,'#ffffff',Math.PI*1.0);
+        ctx.restore();
+      }
       // Foreground effects
       for(const ef of this.effects){ ef.draw(ctx); }
       // Predator invert overlay
@@ -1086,6 +1123,19 @@
     g.addColorStop(1.00,'rgba(255,255,255,0.34)');
     ctx.fillStyle=g;
     ctx.fillRect(x+jx,y+jy,w,h);
+    // Flicker overlay: sample nearby enemies within ~2 grid cells of obstacle center
+    const cx=o.x+o.w*0.5, cy=o.y+o.h*0.5; const nearR=GRID_SIZE*2;
+    const cols=[];
+    for(let bi=0; bi<this.bots.length; bi++){
+      const b=this.bots[bi]; const d=Math.hypot(b.x-cx,b.y-cy); if(d<=nearR){ cols.push(botColor(b.kind)); if(cols.length>4) break; }
+    }
+    if(cols.length){
+      const seed=(Math.sin((o.x*13.37+o.y*7.91)/123.4)+1)*0.5;
+      for(let i=0;i<cols.length;i++){
+        const flick=0.18+0.18*Math.abs(Math.sin(time*6.0 + seed + i*1.7));
+        ctx.save(); ctx.globalAlpha=flick; ctx.fillStyle=cols[i]; ctx.fillRect(x+jx,y+jy,w,h); ctx.restore();
+      }
+    }
     // Soft inner glow
     ctx.save(); ctx.globalAlpha=0.30; ctx.strokeStyle='#ffffff'; ctx.lineWidth=2*scale; ctx.strokeRect(x+jx+1,y+jy+1,w-2,h-2); ctx.restore();
     // Static overlay
